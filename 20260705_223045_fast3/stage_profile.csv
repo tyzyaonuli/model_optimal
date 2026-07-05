@@ -1,0 +1,4 @@
+run_id,case,stage,calls,total_seconds,mean_seconds,max_peak_allocated_gb,max_peak_reserved_gb,min_free_gb
+codex_lighttae_fast3_223045,paper_lighttae_fast3,pipeline_inference,10,123.804,12.380,14.653,22.656,0.296
+codex_lighttae_fast3_223045,paper_lighttae_fast3,vae_decode,10,2.008,0.201,14.309,22.129,0.823
+codex_lighttae_fast3_223045,paper_lighttae_fast3,write_video_submit,10,0.003,0.000,13.612,22.656,0.296

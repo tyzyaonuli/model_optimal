@@ -182,6 +182,15 @@ def patch_wan_inference(wan_inference: Path) -> None:
         "low_memory = args.low_vram or get_cuda_free_memory_gb(gpu) < 40\n",
     )
 
+    text = _insert_after(
+        text,
+        "config = OmegaConf.merge(default_config, config)\n",
+        "_minwm_steps = os.environ.get('MINWM_DENOISING_STEP_LIST', '').strip()\n"
+        "if _minwm_steps:\n"
+        "    config.denoising_step_list = [int(x.strip()) for x in _minwm_steps.split(',') if x.strip()]\n"
+        "    print(f\"[4090] override denoising_step_list={list(config.denoising_step_list)}\")\n",
+    )
+
     text = _insert_after_line_contains(
         text,
         "pipeline.generator.to(device=gpu)",
@@ -223,7 +232,8 @@ def patch_wan_inference(wan_inference: Path) -> None:
         "video, latents = pipeline.inference(",
         lambda line: [
             f"{_indent_of(line)}with llv2_runtime.stage('pipeline_inference'):\n",
-            f"{_indent_of(line)}    {line.lstrip()}",
+            f"{_indent_of(line)}    with torch.inference_mode():\n",
+            f"{_indent_of(line)}        {line.lstrip()}",
         ],
     )
 
@@ -306,6 +316,58 @@ def patch_causal_inference(causal_inference: Path) -> None:
     elif "MINWM_OFFLOAD_GENERATOR_BEFORE_VAE" in text and "decode_to_pixel_memory_efficient" not in text:
         text = backup.read_text(encoding="utf-8")
         original = text
+
+    def _disable_chunk0_sync(src: str) -> str:
+        lines = src.splitlines(True)
+        idx = None
+        for i in range(len(lines) - 2):
+            if (
+                lines[i].strip() == "torch.cuda.synchronize()"
+                and lines[i + 1].strip() == "_chunk0_t0 = time.perf_counter()"
+                and lines[i + 2].strip() == "self.last_chunk0_latency = None"
+            ):
+                idx = i
+                break
+        if idx is not None and "MINWM_RECORD_CHUNK0_LATENCY" not in "".join(lines[max(0, idx - 8): idx + 8]):
+            block_start = max(0, idx - 2)
+            block_end = idx + 3
+            lines = lines[:block_start] + [
+                "        # Start chunk0 latency timer AFTER text encoder, BEFORE VAE decode.\n",
+                "        # Disabled by default for throughput benchmarks because synchronize()\n",
+                "        # serializes the CPU and GPU on every prompt.\n",
+                "        import os as _minwm_os\n",
+                "        _record_chunk0_latency = _minwm_os.environ.get('MINWM_RECORD_CHUNK0_LATENCY', '0').lower() in ('1', 'true', 'yes', 'on')\n",
+                "        if _record_chunk0_latency:\n",
+                "            torch.cuda.synchronize()\n",
+                "            _chunk0_t0 = time.perf_counter()\n",
+                "        else:\n",
+                "            _chunk0_t0 = None\n",
+                "        self.last_chunk0_latency = None\n",
+            ] + lines[block_end:]
+
+        idx = None
+        for i, line in enumerate(lines):
+            if "self.last_chunk0_latency = time.perf_counter() - _chunk0_t0" in line:
+                idx = i
+                break
+        if idx is not None:
+            block_start = idx
+            while block_start > 0:
+                if lines[block_start].strip().startswith("# Capture chunk0 latency"):
+                    break
+                block_start -= 1
+            if "_record_chunk0_latency" not in "".join(lines[block_start: idx + 1]):
+                block_end = idx + 1
+                lines = lines[:block_start] + [
+                    "            # Capture chunk0 latency only when explicitly requested.\n",
+                    "            if _record_chunk0_latency and self.last_chunk0_latency is None:\n",
+                    "                torch.cuda.synchronize()\n",
+                    "                self.last_chunk0_latency = time.perf_counter() - _chunk0_t0\n",
+                    "\n",
+                ] + lines[block_end:]
+        return "".join(lines)
+
+    text = _disable_chunk0_sync(text)
 
     text = _replace_line_contains(
         text,

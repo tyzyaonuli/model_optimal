@@ -10,6 +10,7 @@ minWM 推理代码加低显存运行、计时、显存记录，并输出 benchma
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | Wan VAE chunk | `20260705_213020_wan` | 360.384s | 322.229s | 1.1184x | 1.1583x | 1.3117x |
 | LightTAEW combined | `20260705_214326_combined` | 353.259s | 239.411s | 1.4755x | 1.7830x | 36.4469x |
+| LightTAEW fast3 | `20260705_223045_fast3` | 353.259s | 231.119s | 1.5285x | 2.1393x | 35.6840x |
 
 `生成阶段加速` 更接近真实推理链路，因为它主要统计 `pipeline.inference()` 和视频写入提交；`全流程加速` 还包含子进程启动、patch、import、模型加载等冷启动开销。
 
@@ -216,7 +217,7 @@ python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_minwm_dmd_4090.py
 
 ## 7. 各版本优化思路
 
-### 7.1 `baseline_offload`
+### 8.1 `baseline_offload`
 
 原 minWM 在 4090 上最后 VAE decode 容易 OOM，所以 baseline 使用：
 
@@ -229,7 +230,7 @@ MINWM_TORCHAO_QUANT=none
 
 它的意义是“能稳定跑起来的原始 Wan VAE 版本”，但缺点是 generator 在 VAE 前被搬到 CPU，速度慢。
 
-### 7.2 `wan_chunk`
+### 8.2 `wan_chunk`
 
 仍然使用原 Wan VAE，但把 latent video 按时间维切块 decode：
 
@@ -242,7 +243,7 @@ MINWM_VAE_CHUNK_OVERLAP=0
 
 优点是显存更稳，视频写入也可以异步；缺点是 VAE 本身还是原 Wan VAE，所以速度提升有限。
 
-### 7.3 `paper_lighttae`
+### 8.3 `paper_lighttae`
 
 把最终 VAE decode 替换为 LightX2V 的 LightTAEW 2.1：
 
@@ -411,3 +412,44 @@ __pycache__/
 模型权重
 生成视频
 ```
+
+
+## ??????? 2x ? fast3 ??
+
+? 4-step LightTAE combined ?????? `paper_lighttae_fast3`?????? DMD denoise step ????? generator forward ???
+
+```text
+???: 1000,750,500,250
+fast3:  1000,500,250
+```
+
+?? block ???? `4 ? denoise forward + 1 ? clean-context cache update`?5 ? block ?? 25 ? generator forward?fast3 ? 20 ? generator forward???????????????? tradeoff????????????
+
+?????
+
+```bash
+cd /root/autodl-tmp/workspace/minWM
+
+LIGHTX2V_REPO=/root/autodl-tmp/workspace/LightX2V DATA_PATH=/root/autodl-tmp/workspace/minWM/Wan21/prompts/demos.txt CHECKPOINT_PATH=/root/autodl-tmp/workspace/minWM/ckpts/Wan21/Action2V/dmd/model.pt BENCH_PROMPTS=10 NUM_OUTPUT_FRAMES=20 BASELINE_OFFLOAD_GENERATOR_BEFORE_VAE=1 MINWM_LIGHTX2V_VAE_PATH=/root/autodl-tmp/workspace/lightx2v_ckpts/lighttaew2_1.pth RUN_BASELINE=1 RUN_PAPER_LIGHTTAE=1 RUN_PAPER_LIGHTTAE_FAST3=1 python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_minwm_dmd_4090_combined.py
+```
+
+?? fast3 ???
+
+```bash
+RUN_BASELINE=0 RUN_PAPER_LIGHTTAE=0 RUN_PAPER_LIGHTTAE_FAST3=1 python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_minwm_dmd_4090_combined.py
+```
+
+?????? fast3?
+
+```bash
+MINWM_DENOISING_STEP_LIST=1000,500,250
+```
+
+fast3 ???????`minwm_overlay_docs/20260705_223045_fast3/`
+
+| case | status | wall time | full speedup | generation stage | generation speedup | diffusion excl. VAE | VAE decode | VAE speedup | min free VRAM |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `baseline_offload` | success | 353.259s | 1.0000x | 264.854s | 1.0000x | 186.772s | 71.659s | 1.0000x | 0.176GB |
+| `paper_lighttae_fast3` | success | 231.119s | 1.5285x | 123.807s | 2.1393x | 121.796s | 2.008s | 35.6840x | 0.296GB |
+
+???fast3 ?????? `123.807s`??? baseline `264.854s` ? `2.139x`?????????? 2x??

@@ -27,6 +27,7 @@ os.environ.setdefault("RUN_WAN_CHUNK", "0")
 os.environ.setdefault("RUN_WAN_CHUNK_TORCHAO", "0")
 os.environ.setdefault("RUN_PAPER_LIGHTTAE", "1")
 os.environ.setdefault("RUN_PAPER_LIGHTTAE_TORCHAO", "0")
+os.environ.setdefault("RUN_PAPER_LIGHTTAE_FAST3", "0")
 os.environ.setdefault("OUTPUT_PREFIX", "bench_dmd_4090_combined")
 os.environ.setdefault("RUN_ID_SUFFIX", "combined")
 

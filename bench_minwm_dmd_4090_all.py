@@ -337,6 +337,27 @@ def main() -> int:
                 },
             )
         )
+    if case_enabled("paper_lighttae_fast3", False):
+        cases.append(
+            BenchCase(
+                name="paper_lighttae_fast3",
+                output_dir=output_name(output_prefix, "paper_lighttae_fast3"),
+                env={
+                    **optimized_common,
+                    "OUTPUT_FOLDER": output_name(output_prefix, "paper_lighttae_fast3"),
+                    "MINWM_VAE_BACKEND": "lightx2v_tae",
+                    "MINWM_LIGHTX2V_VAE_PATH": lighttae_path,
+                    "MINWM_LIGHTX2V_DTYPE": os.environ.get("MINWM_LIGHTX2V_DTYPE", "bfloat16"),
+                    "MINWM_LIGHTX2V_NEED_SCALED": os.environ.get("MINWM_LIGHTX2V_NEED_SCALED", "1"),
+                    "MINWM_LIGHTX2V_PARALLEL": lighttae_parallel,
+                    "MINWM_LIGHTX2V_OUTPUT_DEVICE": lighttae_output_device,
+                    "LIGHTX2V_REPO": lightx2v_repo,
+                    "MINWM_DENOISING_STEP_LIST": os.environ.get("MINWM_FAST3_DENOISING_STEP_LIST", "1000,500,250"),
+                    "MINWM_TORCHAO_QUANT": "none",
+                    "MINWM_PROFILE_JSONL": str(result_dir / "paper_lighttae_fast3_profile_rank0.jsonl"),
+                },
+            )
+        )
     if case_enabled("paper_lighttae_torchao", True):
         cases.append(
             BenchCase(
