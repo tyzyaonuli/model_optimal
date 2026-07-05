@@ -1,0 +1,7 @@
+run_id,case,stage,calls,total_seconds,mean_seconds,max_peak_allocated_gb,max_peak_reserved_gb,min_free_gb
+20260705_214326_combined,baseline_offload,pipeline_inference,10,258.430,25.843,15.149,22.949,9.063
+20260705_214326_combined,baseline_offload,vae_decode,10,71.659,7.166,15.149,22.949,0.176
+20260705_214326_combined,baseline_offload,write_video_submit,10,6.424,0.642,13.827,13.889,9.063
+20260705_214326_combined,paper_lighttae,pipeline_inference,10,148.540,14.854,14.653,22.656,0.296
+20260705_214326_combined,paper_lighttae,vae_decode,10,1.966,0.197,14.309,22.129,0.823
+20260705_214326_combined,paper_lighttae,write_video_submit,10,0.003,0.000,13.612,22.656,0.296

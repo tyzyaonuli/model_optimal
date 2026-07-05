@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+
+*.log
+*_profile_rank0.jsonl
+
+outputs/
+*.mp4
+*.pth
+*.safetensors
