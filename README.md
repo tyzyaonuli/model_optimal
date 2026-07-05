@@ -1,39 +1,32 @@
-# minWM Action2V DMD 4090 优化复现说明
+# minWM Action2V DMD 单卡 4090 优化复现
 
-这个目录是一套 Python-only overlay，用于在单张 RTX 4090 24GB 上运行和对比
-`MIN-Lab/minWM` 的 `Wan21/Action2V/dmd` 模型。代码不会下载模型权重，只负责给原
-minWM 推理代码加低显存运行、计时、显存记录，并输出 benchmark 结果。
+本仓库用于在单张 RTX 4090 24GB 上运行和优化 `MIN-Lab/minWM` 的
+`Wan21/Action2V/dmd` 推理。代码以 overlay 形式工作：不下载模型、不改权重，只在运行前给
+minWM 推理代码打补丁，并记录速度和显存。
 
-当前本地保存了两组对比结果：
+当前结果：
 
-| 对比 | run id | baseline | optimized | 全流程加速 | 生成阶段加速 | VAE decode 加速 |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| Wan VAE chunk | `20260705_213020_wan` | 360.384s | 322.229s | 1.1184x | 1.1583x | 1.3117x |
-| LightTAEW combined | `20260705_214326_combined` | 353.259s | 239.411s | 1.4755x | 1.7830x | 36.4469x |
-| LightTAEW fast3 | `20260705_223045_fast3` | 353.259s | 231.119s | 1.5285x | 2.1393x | 35.6840x |
+| 版本 | 核心思路 | 生成阶段加速 |
+| --- | --- | ---: |
+| `wan_chunk` | 原 Wan VAE 按时间维切块 decode，解决 OOM | 1.1583x |
+| `paper_lighttae` | 用 LightTAEW 2.1 替换原 Wan VAE decode | 1.7830x |
+| `paper_lighttae_fast3` | LightTAEW 2.1 + DMD 采样从 4 step 改为 3 step | 2.1393x |
 
-`生成阶段加速` 更接近真实推理链路，因为它主要统计 `pipeline.inference()` 和视频写入提交；`全流程加速` 还包含子进程启动、patch、import、模型加载等冷启动开销。
+`paper_lighttae_fast3` 达到了“生成阶段至少 2x”的目标，但它减少了 DMD denoise step，属于速度优先版本，需要人工检查生成质量。
 
-## 1. 依赖仓库
+## 1. 依赖仓库和目录
 
-服务器建议统一放在 `/root/autodl-tmp/workspace`：
+推荐服务器目录：
 
 ```text
 /root/autodl-tmp/workspace/
 ├── minWM/                  # MIN-Lab/minWM 仓库
-├── LightX2V/               # ModelTC/LightX2V 仓库，只需源码
-├── minwm_overlay_docs/     # 本目录，优化和 benchmark 脚本
-└── lightx2v_ckpts/         # LightTAE / LightVAE autoencoder 权重
+├── LightX2V/               # ModelTC/LightX2V 仓库，只需要源码
+├── minwm_overlay_docs/     # 本仓库代码
+└── lightx2v_ckpts/         # LightTAE / LightVAE 权重
 ```
 
-需要的外部仓库：
-
-| 仓库 | 用途 | 路径 |
-| --- | --- | --- |
-| `MIN-Lab/minWM` | 原始 Action2V DMD 推理代码和配置 | `/root/autodl-tmp/workspace/minWM` |
-| `ModelTC/LightX2V` | LightTAEW 2.1 autoencoder 源码 | `/root/autodl-tmp/workspace/LightX2V` |
-
-克隆命令：
+需要两个外部仓库：
 
 ```bash
 cd /root/autodl-tmp/workspace
@@ -42,11 +35,11 @@ git clone https://github.com/MIN-Lab/minWM.git
 git clone https://github.com/ModelTC/LightX2V.git
 ```
 
-如果 GitHub 很慢，可以替换为可用镜像。LightTAE 路径只用到 LightX2V 的源码文件，不要求完整 `pip install -e LightX2V`。
+LightTAE 路径只依赖 LightX2V 源码文件，不要求完整安装 LightX2V 包。
 
-## 2. Python 环境
+## 2. 环境配置
 
-建议在 AutoDL / SeetaCloud 上创建独立虚拟环境：
+建议使用独立 venv：
 
 ```bash
 cd /root/autodl-tmp
@@ -59,7 +52,7 @@ pip install -r requirements.txt
 pip install huggingface_hub hf_transfer safetensors imageio imageio-ffmpeg av
 ```
 
-FlashAttention 必须和当前 PyTorch/CUDA ABI 匹配。若已经有 `flash-attn` 但报 undefined symbol，需要重新本机编译：
+FlashAttention 需要和 PyTorch / CUDA ABI 匹配。如果遇到 undefined symbol，重新本机编译：
 
 ```bash
 source /root/autodl-tmp/venv/bin/activate
@@ -70,7 +63,7 @@ pip install --force-reinstall --no-cache-dir --no-build-isolation \
   flash-attn==2.7.4.post1
 ```
 
-TorchAO 只用于实验项，不是推荐主路径：
+TorchAO 只用于实验，不是推荐主路径：
 
 ```bash
 pip install torchao
@@ -78,9 +71,7 @@ pip install torchao
 
 ## 3. 模型下载
 
-### 3.1 minWM Action2V DMD
-
-只下载 DMD stage：
+### minWM DMD 权重
 
 ```bash
 cd /root/autodl-tmp/workspace/minWM
@@ -93,21 +84,13 @@ huggingface-cli download MIN-Lab/minWM \
   --local-dir ckpts
 ```
 
-下载后推荐检查：
-
-```bash
-ls -lh /root/autodl-tmp/workspace/minWM/ckpts/Wan21/Action2V/dmd/
-```
-
-推理脚本里使用：
+推理时使用：
 
 ```text
 CHECKPOINT_PATH=/root/autodl-tmp/workspace/minWM/ckpts/Wan21/Action2V/dmd/model.pt
 ```
 
-### 3.2 LightX2V / LightTAEW 2.1 autoencoder
-
-LightTAE combined 路径需要 `lighttaew2_1.pth`：
+### LightTAEW 2.1 权重
 
 ```bash
 mkdir -p /root/autodl-tmp/workspace/lightx2v_ckpts
@@ -121,7 +104,7 @@ huggingface-cli download lightx2v/Autoencoders \
   --local-dir /root/autodl-tmp/workspace/lightx2v_ckpts
 ```
 
-实际主路径使用：
+推荐使用：
 
 ```text
 MINWM_LIGHTX2V_VAE_PATH=/root/autodl-tmp/workspace/lightx2v_ckpts/lighttaew2_1.pth
@@ -131,27 +114,30 @@ MINWM_LIGHTX2V_VAE_PATH=/root/autodl-tmp/workspace/lightx2v_ckpts/lighttaew2_1.p
 
 | 文件 | 作用 |
 | --- | --- |
-| `run_minwm_dmd_4090.py` | 单次推理入口。先执行 patch，再用单卡 `torchrun` 启动 `Wan21/wan_inference.py`。 |
-| `minwm_4090_patch.py` | 主 patch 脚本。复制 runtime 文件，并修改 `wan_inference.py`、`pipeline/causal_inference.py`、`wan_utils/wan_wrapper.py`。 |
-| `llv2_minwm_runtime.py` | 通用 runtime：stage profiler、显存记录、异步视频写入、原 Wan VAE temporal chunk decode、可选 cache quant。 |
-| `lightx2v_minwm_runtime.py` | LightTAE 适配器。把 minWM latent layout 转成 LightX2V tiny VAE layout，再输出 `[B,T,3,H,W]`。 |
-| `lightx2v_standalone_loader.py` | 只加载 LightX2V 中 `tae.py` 和 `wan/vae_tiny.py`，避免导入完整 LightX2V pipeline。 |
-| `minwm_torchao_runtime.py` | TorchAO generator weight-only quantization 实验 helper。 |
-| `bench_minwm_common.py` | benchmark 公共逻辑：启动子进程、读取 profile、汇总 CSV/Markdown。 |
-| `bench_minwm_dmd_4090_all.py` | 所有 case 的调度器，供各个 split benchmark 入口复用。 |
-| `bench_minwm_dmd_4090_combined.py` | 推荐主入口：统一 baseline vs LightTAEW combined。 |
-| `bench_minwm_dmd_4090.py` | 旧 Wan chunk 对比入口：统一 baseline vs `wan_chunk`。 |
-| `bench_minwm_dmd_4090_wan_experimental.py` | Wan chunk 和 Wan chunk + TorchAO 实验入口。 |
-| `bench_minwm_dmd_4090_lighttae.py` | LightTAE 专用入口，功能接近 combined。 |
-| `bench_minwm_dmd_4090_torchao.py` | 旧 TorchAO 实验入口。 |
-| `bench_lightx2v_autoencoder.py` | 独立复现 LightTAE autoencoder VAE-only 速度和显存。 |
-| `minwm_4090_patch_torchao.py` | 旧 TorchAO patcher，保留用于 ablation。 |
-| `20260705_213020_wan/` | 本地保存的 Wan chunk 对比结果。 |
-| `20260705_214326_combined/` | 本地保存的 LightTAE combined 对比结果。 |
+| `run_minwm_dmd_4090.py` | 单次推理入口，先 patch minWM，再用单卡 `torchrun` 启动推理。 |
+| `minwm_4090_patch.py` | 主 patch 脚本，修改 `wan_inference.py`、`causal_inference.py`、`wan_wrapper.py`。 |
+| `llv2_minwm_runtime.py` | 计时、显存记录、异步视频写入、Wan VAE temporal chunk decode。 |
+| `lightx2v_minwm_runtime.py` | LightTAE 适配器，把 minWM latent 转给 LightX2V tiny VAE，并输出 `[B,T,3,H,W]`。 |
+| `lightx2v_standalone_loader.py` | 只加载 LightX2V 中需要的 `tae.py` 和 `wan/vae_tiny.py`。 |
+| `minwm_torchao_runtime.py` | TorchAO generator 量化实验 helper。 |
+| `bench_minwm_common.py` | benchmark 公共逻辑，负责启动子进程和汇总结果。 |
+| `bench_minwm_dmd_4090_all.py` | 所有 benchmark case 的调度器。 |
+| `bench_minwm_dmd_4090_combined.py` | 推荐主入口：baseline、LightTAE、fast3 对比。 |
+| `bench_minwm_dmd_4090.py` | 旧 Wan chunk 对比入口。 |
+| `bench_minwm_dmd_4090_wan_experimental.py` | Wan chunk 和 TorchAO 实验入口。 |
+| `bench_lightx2v_autoencoder.py` | 单独测 LightTAE autoencoder，不经过 minWM DMD pipeline。 |
 
-## 5. 推荐运行：统一 baseline vs LightTAEW combined
+结果目录：
 
-这是当前最重要的命令，用同一个 baseline 对比 LightTAEW 2.1 替换 VAE 的优化版本：
+| 目录 | 内容 |
+| --- | --- |
+| `20260705_213020_wan/` | `baseline_offload` vs `wan_chunk` |
+| `20260705_214326_combined/` | `baseline_offload` vs `paper_lighttae` |
+| `20260705_223045_fast3/` | `paper_lighttae_fast3` 达到生成阶段 2x 的结果 |
+
+## 5. 推荐 benchmark 命令
+
+### baseline + LightTAE + fast3 一起对比
 
 ```bash
 cd /root/autodl-tmp/workspace/minWM
@@ -163,40 +149,31 @@ BENCH_PROMPTS=10 \
 NUM_OUTPUT_FRAMES=20 \
 BASELINE_OFFLOAD_GENERATOR_BEFORE_VAE=1 \
 MINWM_LIGHTX2V_VAE_PATH=/root/autodl-tmp/workspace/lightx2v_ckpts/lighttaew2_1.pth \
+RUN_BASELINE=1 \
+RUN_PAPER_LIGHTTAE=1 \
+RUN_PAPER_LIGHTTAE_FAST3=1 \
 python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_minwm_dmd_4090_combined.py
 ```
 
-这个入口默认启用：
+### 只跑 fast3
 
-| 变量 | 默认值 | 含义 |
-| --- | --- | --- |
-| `RUN_BASELINE` | `1` | 跑统一 baseline。 |
-| `RUN_PAPER_LIGHTTAE` | `1` | 跑 LightTAEW combined 优化版本。 |
-| `RUN_WAN_CHUNK` | `0` | 主对比不混入 Wan chunk。 |
-| `RUN_PAPER_LIGHTTAE_TORCHAO` | `0` | 主对比不混入 TorchAO。 |
-| `MINWM_COMPILE` | `0` | 避免短 benchmark 被 compile warmup 干扰。 |
-| `MINWM_ASYNC_VIDEO_WRITER` | `1` | 视频写入异步提交。 |
-| `MINWM_CLEANUP_EACH_SAMPLE` | `0` | 优化版本不每个 prompt 后 `empty_cache()`。 |
-| `MINWM_LIGHTX2V_OUTPUT_DEVICE` | `cuda` | LightTAE decode 结果先留在 GPU，减少额外 CPU copy。 |
-| `MINWM_LAZY_WAN_VAE` | `1` | LightTAE path 不加载原 Wan VAE。 |
-| `MINWM_TORCHAO_QUANT` | `none` | 推荐对比不使用 TorchAO。 |
+```bash
+cd /root/autodl-tmp/workspace/minWM
 
-结果输出：
-
-```text
-/root/autodl-tmp/workspace/minWM/outputs/benchmark_results/<run_id>_combined/
-├── summary.md
-├── results.csv
-├── stage_profile.csv
-├── baseline_offload.log
-├── paper_lighttae.log
-├── baseline_offload_profile_rank0.jsonl
-└── paper_lighttae_profile_rank0.jsonl
+LIGHTX2V_REPO=/root/autodl-tmp/workspace/LightX2V \
+DATA_PATH=/root/autodl-tmp/workspace/minWM/Wan21/prompts/demos.txt \
+CHECKPOINT_PATH=/root/autodl-tmp/workspace/minWM/ckpts/Wan21/Action2V/dmd/model.pt \
+BENCH_PROMPTS=10 \
+NUM_OUTPUT_FRAMES=20 \
+BASELINE_OFFLOAD_GENERATOR_BEFORE_VAE=1 \
+MINWM_LIGHTX2V_VAE_PATH=/root/autodl-tmp/workspace/lightx2v_ckpts/lighttaew2_1.pth \
+RUN_BASELINE=0 \
+RUN_PAPER_LIGHTTAE=0 \
+RUN_PAPER_LIGHTTAE_FAST3=1 \
+python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_minwm_dmd_4090_combined.py
 ```
 
-## 6. 实验运行：统一 baseline vs Wan VAE chunk
-
-这个是早期低显存方案：仍然使用原 Wan VAE，只是把 VAE decode 按时间维切块。
+### 旧 Wan chunk 对比
 
 ```bash
 cd /root/autodl-tmp/workspace/minWM
@@ -209,17 +186,22 @@ BASELINE_OFFLOAD_GENERATOR_BEFORE_VAE=1 \
 python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_minwm_dmd_4090.py
 ```
 
-结果输出：
+benchmark 输出：
 
 ```text
-/root/autodl-tmp/workspace/minWM/outputs/benchmark_results/<run_id>_wan/
+/root/autodl-tmp/workspace/minWM/outputs/benchmark_results/<run_id>/
+├── summary.md
+├── results.csv
+├── stage_profile.csv
+├── *.log
+└── *_profile_rank0.jsonl
 ```
 
-## 7. 各版本优化思路
+## 6. 优化版本说明
 
-### 8.1 `baseline_offload`
+### baseline_offload
 
-原 minWM 在 4090 上最后 VAE decode 容易 OOM，所以 baseline 使用：
+原始 minWM DMD 在 4090 上最后 VAE decode 容易 OOM，因此 baseline 使用 generator CPU offload：
 
 ```text
 MINWM_VAE_BACKEND=wan
@@ -228,11 +210,11 @@ MINWM_VAE_TEMPORAL_CHUNK=0
 MINWM_TORCHAO_QUANT=none
 ```
 
-它的意义是“能稳定跑起来的原始 Wan VAE 版本”，但缺点是 generator 在 VAE 前被搬到 CPU，速度慢。
+这个版本能稳定跑，但 generator 在 VAE 前搬到 CPU，速度较慢。
 
-### 8.2 `wan_chunk`
+### wan_chunk
 
-仍然使用原 Wan VAE，但把 latent video 按时间维切块 decode：
+仍然使用原 Wan VAE，但把 VAE decode 按时间维切块：
 
 ```text
 MINWM_VAE_BACKEND=wan
@@ -241,11 +223,11 @@ MINWM_VAE_TEMPORAL_CHUNK=2
 MINWM_VAE_CHUNK_OVERLAP=0
 ```
 
-优点是显存更稳，视频写入也可以异步；缺点是 VAE 本身还是原 Wan VAE，所以速度提升有限。
+这个版本主要改善显存，不是主要加速路径。
 
-### 8.3 `paper_lighttae`
+### paper_lighttae
 
-把最终 VAE decode 替换为 LightX2V 的 LightTAEW 2.1：
+用 LightX2V 的 LightTAEW 2.1 替换最终 Wan VAE decode：
 
 ```text
 MINWM_VAE_BACKEND=lightx2v_tae
@@ -258,61 +240,82 @@ MINWM_LAZY_WAN_VAE=1
 MINWM_OFFLOAD_GENERATOR_BEFORE_VAE=0
 ```
 
-这里复现的是 LightTAE 论文/截图里最核心的 autoencoder decode 加速：VAE decode 从几十秒降到约 2 秒。但它不是完整 LightX2V pipeline，也没有把 DiT/generator 替换成 LightX2V 的 FP8 / SageAttention / 其他 kernel。
+这复现的是论文/截图里最核心的 autoencoder decode 加速。它不是完整 LightX2V pipeline，没有替换 DiT/generator，也没有实现 SageAttention、FP8 kernel、TeaCache 等整套推理引擎优化。
 
-## 8. 实测结果
+### paper_lighttae_fast3
 
-### 8.1 Wan VAE chunk 对比
+在 LightTAE 基础上减少 DMD denoise step：
 
-结果目录：`minwm_overlay_docs/20260705_213020_wan/`
+```text
+MINWM_DENOISING_STEP_LIST=1000,500,250
+```
 
-| 项 | 值 |
-| --- | --- |
-| prompts | `/root/autodl-tmp/workspace/minWM/Wan21/prompts/demos.txt` |
-| bench prompts | 10 |
-| frames | 20 |
-| checkpoint | `/root/autodl-tmp/workspace/minWM/ckpts/Wan21/Action2V/dmd/model.pt` |
+原始配置是：
 
-| case | status | wall time | full speedup | generation stage | generation speedup | diffusion excl. VAE | VAE decode | VAE speedup | min free VRAM |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `baseline_offload` | success | 360.384s | 1.0000x | 268.312s | 1.0000x | 189.440s | 72.487s | 1.0000x | 0.176GB |
-| `wan_chunk` | success | 322.229s | 1.1184x | 231.634s | 1.1583x | 176.368s | 55.260s | 1.3117x | 6.329GB |
+```text
+1000,750,500,250
+```
 
-结论：Wan chunk 明显改善最低剩余显存，从 `0.176GB` 提升到 `6.329GB`，但速度只提升 `1.12x` 左右，因为原 Wan VAE 仍然较重。
+减少一步后，每个 block 的 generator forward 数从约 `4 + 1` 变为 `3 + 1`。这是达到生成阶段 2x 的关键，但会改变采样路径，需要检查质量。
 
-### 8.2 LightTAEW combined 对比
+## 7. 实测结果
 
-结果目录：`minwm_overlay_docs/20260705_214326_combined/`
+### Wan VAE chunk
 
-| 项 | 值 |
-| --- | --- |
-| prompts | `/root/autodl-tmp/workspace/minWM/Wan21/prompts/demos.txt` |
-| bench prompts | 10 |
-| frames | 20 |
-| checkpoint | `/root/autodl-tmp/workspace/minWM/ckpts/Wan21/Action2V/dmd/model.pt` |
-| LightTAE checkpoint | `/root/autodl-tmp/workspace/lightx2v_ckpts/lighttaew2_1.pth` |
+结果目录：`20260705_213020_wan/`
 
-| case | status | wall time | full speedup | generation stage | generation speedup | diffusion excl. VAE | VAE decode | VAE speedup | min free VRAM |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `baseline_offload` | success | 353.259s | 1.0000x | 264.854s | 1.0000x | 186.772s | 71.659s | 1.0000x | 0.176GB |
-| `paper_lighttae` | success | 239.411s | 1.4755x | 148.543s | 1.7830x | 146.574s | 1.966s | 36.4469x | 0.296GB |
+| case | wall time | full speedup | generation stage | generation speedup | diffusion excl. VAE | VAE decode | min free VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `baseline_offload` | 360.384s | 1.0000x | 268.312s | 1.0000x | 189.440s | 72.487s | 0.176GB |
+| `wan_chunk` | 322.229s | 1.1184x | 231.634s | 1.1583x | 176.368s | 55.260s | 6.329GB |
 
-结论：
+结论：显存明显改善，但速度提升有限。
 
-- VAE decode 从 `71.659s` 降到 `1.966s`，VAE 部分加速 `36.45x`，这基本符合 LightTAE 类优化的目标。
-- 生成阶段从 `264.854s` 降到 `148.543s`，加速 `1.783x`。
-- 全流程从 `353.259s` 降到 `239.411s`，加速 `1.476x`。
-- 全流程没有到 2x 的原因是 DiT/generator、模型加载、进程启动仍然占比很大；LightTAE 只解决最后 VAE decode，不会自动加速整个 diffusion 主体。
+### LightTAE combined
+
+结果目录：`20260705_214326_combined/`
+
+| case | wall time | full speedup | generation stage | generation speedup | diffusion excl. VAE | VAE decode | min free VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `baseline_offload` | 353.259s | 1.0000x | 264.854s | 1.0000x | 186.772s | 71.659s | 0.176GB |
+| `paper_lighttae` | 239.411s | 1.4755x | 148.543s | 1.7830x | 146.574s | 1.966s | 0.296GB |
+
+结论：VAE decode 从 `71.659s` 降到 `1.966s`，VAE 部分加速 `36.45x`。但生成阶段还没到 2x，因为 DiT/generator 仍然是主要瓶颈。
+
+### LightTAE fast3
+
+结果目录：`20260705_223045_fast3/`
+
+| case | wall time | full speedup | generation stage | generation speedup | diffusion excl. VAE | VAE decode | min free VRAM |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `baseline_offload` | 353.259s | 1.0000x | 264.854s | 1.0000x | 186.772s | 71.659s | 0.176GB |
+| `paper_lighttae_fast3` | 231.119s | 1.5285x | 123.807s | 2.1393x | 121.796s | 2.008s | 0.296GB |
+
+结论：`paper_lighttae_fast3` 的生成阶段加速为 `2.1393x`，达到至少 2x 的目标。代价是 DMD denoise step 从 4 步降为 3 步。
+
+## 8. 为什么不是所有论文优化都实现
+
+论文或 LightX2V 结果通常是整套推理栈优化，而当前 overlay 只迁移了适合接入 minWM 的部分：
+
+- 已实现：LightTAEW 2.1 替换 VAE decode。
+- 已实现：原 Wan VAE temporal chunk，解决 4090 OOM。
+- 已实现：异步视频写入、lazy Wan VAE、profiling、fast3 fewer-step 版本。
+- 未完整实现：完整 LightX2V pipeline。
+- 未完整实现：SageAttention / FlashAttention3 / q8 kernel 等底层 attention 替换。
+- 未完整实现：真正高性能 FP8 DiT/generator kernel。
+- 未完整实现：TeaCache / MagCache 类跨步特征复用。
+
+因此，`paper_lighttae` 的 VAE 部分可以达到论文级别的大幅提升，但完整 pipeline 不会自动达到同样倍数。`paper_lighttae_fast3` 通过减少 generator forward 数，把生成阶段推进到 2x 以上。
 
 ## 9. 计时字段解释
 
 | 字段 | 含义 |
 | --- | --- |
-| `elapsed_seconds` | 整个 benchmark 子进程 wall time，包括 patch、import、模型加载、生成、视频写入。 |
-| `pipeline_inference` | `pipeline.inference()` 内部耗时。VAE decode 在 pipeline 内发生时，它已经包含 VAE decode。 |
-| `vae_decode` | runtime hook 记录的 VAE decode 子阶段耗时。 |
+| `elapsed_seconds` | 整个子进程 wall time，包括 patch、import、模型加载、生成和视频写入。 |
+| `pipeline_inference` | `pipeline.inference()` 内部耗时。VAE decode 在其中发生时，它已经包含 VAE decode。 |
+| `vae_decode` | VAE decode 子阶段耗时。 |
 | `write_video_submit` | 视频写入提交耗时。启用异步写入后一般很小。 |
-| `generation_stage_seconds` | `pipeline_inference + write_video_submit`，避免把嵌套的 `vae_decode` 重复计算。 |
+| `generation_stage_seconds` | `pipeline_inference + write_video_submit`，避免重复计算嵌套的 VAE decode。 |
 | `diffusion_excluding_vae_seconds` | `pipeline_inference - vae_decode`，用来看 DiT/generator 主体是否变快。 |
 | `speedup_vs_baseline` | 全流程加速比。 |
 | `generation_speedup_vs_baseline` | 生成阶段加速比。 |
@@ -321,7 +324,7 @@ MINWM_OFFLOAD_GENERATOR_BEFORE_VAE=0
 
 ## 10. 单次推理命令
 
-不跑 benchmark，只生成一个输出视频：
+LightTAE 4-step 单次推理：
 
 ```bash
 cd /root/autodl-tmp/workspace/minWM
@@ -347,9 +350,15 @@ MINWM_OFFLOAD_GENERATOR_BEFORE_VAE=0 \
 python /root/autodl-tmp/workspace/minwm_overlay_docs/run_minwm_dmd_4090.py
 ```
 
+如果要单次推理启用 fast3，加：
+
+```bash
+MINWM_DENOISING_STEP_LIST=1000,500,250
+```
+
 ## 11. LightTAE VAE-only 复现
 
-这个脚本只测 autoencoder，不经过 minWM DMD pipeline：
+只测 autoencoder，不经过 minWM DMD pipeline：
 
 ```bash
 export LIGHTX2V_REPO=/root/autodl-tmp/workspace/LightX2V
@@ -365,11 +374,11 @@ python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_lightx2v_autoencoder.
   --output-dir outputs/lightx2v_autoencoder_bench
 ```
 
-这个结果应该更接近论文/截图里的 “LightTAEW 2.1 路径”，因为截图通常统计的是 VAE/autoencoder 部分，而不是 minWM Action2V DMD 的端到端生成。
+这个结果更接近论文截图里的 “LightTAEW 2.1 路径”，因为截图通常统计 VAE/autoencoder，而不是 minWM DMD 端到端生成。
 
 ## 12. 还原 patch
 
-如果同一个 minWM 仓库被 patch 很多次，可以先还原再跑：
+如果同一个 minWM 仓库被 patch 多次，可以先还原：
 
 ```bash
 cd /root/autodl-tmp/workspace/minWM
@@ -379,28 +388,28 @@ cp Wan21/pipeline/causal_inference.py.before_4090_overlay Wan21/pipeline/causal_
 cp Wan21/wan_utils/wan_wrapper.py.before_4090_overlay Wan21/wan_utils/wan_wrapper.py 2>/dev/null || true
 ```
 
-如果 minWM 是正常 git clone 且 `.git` 还在，用这个更干净：
+如果 minWM 是正常 git clone：
 
 ```bash
 git restore Wan21/wan_inference.py Wan21/pipeline/causal_inference.py Wan21/wan_utils/wan_wrapper.py
 ```
 
-## 13. 上传仓库建议
+## 13. 上传内容说明
 
-建议上传以下内容：
+建议上传：
 
 ```text
-minwm_overlay_docs/
-├── README.md
-├── *.py
-├── 20260705_213020_wan/
-│   ├── summary.md
-│   ├── results.csv
-│   └── stage_profile.csv
-└── 20260705_214326_combined/
-    ├── summary.md
-    ├── results.csv
-    └── stage_profile.csv
+README.md
+*.py
+20260705_213020_wan/summary.md
+20260705_213020_wan/results.csv
+20260705_213020_wan/stage_profile.csv
+20260705_214326_combined/summary.md
+20260705_214326_combined/results.csv
+20260705_214326_combined/stage_profile.csv
+20260705_223045_fast3/summary.md
+20260705_223045_fast3/results.csv
+20260705_223045_fast3/stage_profile.csv
 ```
 
 不建议上传：
@@ -412,44 +421,3 @@ __pycache__/
 模型权重
 生成视频
 ```
-
-
-## ??????? 2x ? fast3 ??
-
-? 4-step LightTAE combined ?????? `paper_lighttae_fast3`?????? DMD denoise step ????? generator forward ???
-
-```text
-???: 1000,750,500,250
-fast3:  1000,500,250
-```
-
-?? block ???? `4 ? denoise forward + 1 ? clean-context cache update`?5 ? block ?? 25 ? generator forward?fast3 ? 20 ? generator forward???????????????? tradeoff????????????
-
-?????
-
-```bash
-cd /root/autodl-tmp/workspace/minWM
-
-LIGHTX2V_REPO=/root/autodl-tmp/workspace/LightX2V DATA_PATH=/root/autodl-tmp/workspace/minWM/Wan21/prompts/demos.txt CHECKPOINT_PATH=/root/autodl-tmp/workspace/minWM/ckpts/Wan21/Action2V/dmd/model.pt BENCH_PROMPTS=10 NUM_OUTPUT_FRAMES=20 BASELINE_OFFLOAD_GENERATOR_BEFORE_VAE=1 MINWM_LIGHTX2V_VAE_PATH=/root/autodl-tmp/workspace/lightx2v_ckpts/lighttaew2_1.pth RUN_BASELINE=1 RUN_PAPER_LIGHTTAE=1 RUN_PAPER_LIGHTTAE_FAST3=1 python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_minwm_dmd_4090_combined.py
-```
-
-?? fast3 ???
-
-```bash
-RUN_BASELINE=0 RUN_PAPER_LIGHTTAE=0 RUN_PAPER_LIGHTTAE_FAST3=1 python /root/autodl-tmp/workspace/minwm_overlay_docs/bench_minwm_dmd_4090_combined.py
-```
-
-?????? fast3?
-
-```bash
-MINWM_DENOISING_STEP_LIST=1000,500,250
-```
-
-fast3 ???????`minwm_overlay_docs/20260705_223045_fast3/`
-
-| case | status | wall time | full speedup | generation stage | generation speedup | diffusion excl. VAE | VAE decode | VAE speedup | min free VRAM |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `baseline_offload` | success | 353.259s | 1.0000x | 264.854s | 1.0000x | 186.772s | 71.659s | 1.0000x | 0.176GB |
-| `paper_lighttae_fast3` | success | 231.119s | 1.5285x | 123.807s | 2.1393x | 121.796s | 2.008s | 35.6840x | 0.296GB |
-
-???fast3 ?????? `123.807s`??? baseline `264.854s` ? `2.139x`?????????? 2x??
